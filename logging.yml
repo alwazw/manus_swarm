@@ -1,0 +1,264 @@
+# Logging & Log Management Stack
+# Grafana Loki-based logging ecosystem
+
+services:
+  # =============================================================================
+  # LOKI - Log Aggregation & Storage
+  # =============================================================================
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+      - ./config/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    networks:
+      - logging_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.loki.rule=Host(`${LOKI_SUBDOMAIN}.${PRIMARY_DOMAIN}`) || Host(`${LOKI_SUBDOMAIN}.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.loki.tls=true"
+      - "traefik.http.routers.loki.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.loki.loadbalancer.server.port=3100"
+
+  # =============================================================================
+  # PROMTAIL - Log Shipping Agent
+  # =============================================================================
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - promtail_data:/promtail
+      - ./config/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - logging_network
+
+  # =============================================================================
+  # FLUENT BIT - Alternative Log Processor
+  # =============================================================================
+  fluent-bit:
+    image: fluent/fluent-bit:latest
+    container_name: fluent-bit
+    restart: unless-stopped
+    volumes:
+      - ./config/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./config/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - loki
+    networks:
+      - logging_network
+
+  # =============================================================================
+  # VECTOR - High-Performance Log Router
+  # =============================================================================
+  vector:
+    image: timberio/vector:latest-alpine
+    container_name: vector
+    restart: unless-stopped
+    volumes:
+      - ./config/vector/vector.toml:/etc/vector/vector.toml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+    networks:
+      - logging_network
+
+  # =============================================================================
+  # DOZZLE - Real-time Log Viewer
+  # =============================================================================
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: dozzle
+    restart: unless-stopped
+    environment:
+      - DOZZLE_LEVEL=info
+      - DOZZLE_TAILSIZE=300
+      - DOZZLE_FILTER="status=running"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - logging_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dozzle.rule=Host(`logs.${PRIMARY_DOMAIN}`) || Host(`logs.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.dozzle.tls=true"
+      - "traefik.http.routers.dozzle.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.dozzle.loadbalancer.server.port=8080"
+
+  # =============================================================================
+  # LOGROTATE - Log Rotation Management
+  # =============================================================================
+  logrotate:
+    image: linkyard/docker-logrotate:latest
+    container_name: logrotate
+    restart: unless-stopped
+    environment:
+      - LOGS_DIRECTORIES=/var/lib/docker/containers /var/log
+      - LOGROTATE_INTERVAL=daily
+      - LOGROTATE_COPIES=7
+      - LOGROTATE_SIZE=100M
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers
+      - /var/log:/var/log
+    networks:
+      - logging_network
+
+  # =============================================================================
+  # ELASTICSEARCH - Alternative Log Storage (Optional)
+  # =============================================================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - logging_network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # =============================================================================
+  # KIBANA - Elasticsearch Dashboard (Optional)
+  # =============================================================================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - SERVER_PUBLICBASEURL=https://kibana.${PRIMARY_DOMAIN}
+    depends_on:
+      - elasticsearch
+    networks:
+      - logging_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.kibana.rule=Host(`kibana.${PRIMARY_DOMAIN}`) || Host(`kibana.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.kibana.tls=true"
+      - "traefik.http.routers.kibana.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.kibana.loadbalancer.server.port=5601"
+
+  # =============================================================================
+  # FILEBEAT - Log Shipper for ELK Stack (Optional)
+  # =============================================================================
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.11.0
+    container_name: filebeat
+    restart: unless-stopped
+    user: root
+    volumes:
+      - ./config/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log:/var/log:ro
+      - filebeat_data:/usr/share/filebeat/data
+    depends_on:
+      - elasticsearch
+    networks:
+      - logging_network
+    command: filebeat -e -strict.perms=false
+
+  # =============================================================================
+  # GRAYLOG - Enterprise Log Management (Alternative)
+  # =============================================================================
+  graylog-mongo:
+    image: mongo:5.0
+    container_name: graylog-mongo
+    restart: unless-stopped
+    volumes:
+      - graylog_mongo_data:/data/db
+    networks:
+      - logging_network
+
+  graylog-opensearch:
+    image: opensearchproject/opensearch:2.4.0
+    container_name: graylog-opensearch
+    restart: unless-stopped
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - "bootstrap.memory_lock=true"
+      - "discovery.type=single-node"
+      - "action.auto_create_index=false"
+      - "plugins.security.ssl.http.enabled=false"
+      - "plugins.security.disabled=true"
+    volumes:
+      - graylog_opensearch_data:/usr/share/opensearch/data
+    ulimits:
+      memlock:
+        hard: -1
+        soft: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - logging_network
+
+  graylog:
+    image: graylog/graylog:5.2
+    container_name: graylog
+    restart: unless-stopped
+    environment:
+      - GRAYLOG_PASSWORD_SECRET=${AUTHENTIK_SECRET_KEY}
+      - GRAYLOG_ROOT_PASSWORD_SHA2=$(echo -n "${USER_PASSWORD}" | sha256sum | cut -d" " -f1)
+      - GRAYLOG_HTTP_EXTERNAL_URI=https://graylog.${PRIMARY_DOMAIN}/
+      - GRAYLOG_ELASTICSEARCH_HOSTS=http://graylog-opensearch:9200
+      - GRAYLOG_MONGODB_URI=mongodb://graylog-mongo:27017/graylog
+    volumes:
+      - graylog_data:/usr/share/graylog/data
+    depends_on:
+      - graylog-mongo
+      - graylog-opensearch
+    networks:
+      - logging_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.graylog.rule=Host(`graylog.${PRIMARY_DOMAIN}`) || Host(`graylog.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.graylog.tls=true"
+      - "traefik.http.routers.graylog.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.graylog.loadbalancer.server.port=9000"
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  logging_network:
+    driver: bridge
+    internal: false
+  proxy_network:
+    external: true
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  loki_data:
+  promtail_data:
+  elasticsearch_data:
+  filebeat_data:
+  graylog_mongo_data:
+  graylog_opensearch_data:
+  graylog_data:
+

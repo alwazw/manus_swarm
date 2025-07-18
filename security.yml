@@ -1,87 +1,359 @@
-
-# security.yml
-version: '3.8'
+# Security & Authentication Stack
+# Comprehensive security scanning and SSO authentication
 
 services:
-  vaultwarden:
-    <<: *default-app-config # Extend common settings
-    container_name: vaultwarden
-    image: ghcr.io/dani-garcia/vaultwarden:latest
-    restart: always
-    ports:
-      - "${VAULTWARDEN_PORT}:80"
+  # =============================================================================
+  # AUTHENTIK - Single Sign-On & Identity Provider
+  # =============================================================================
+  authentik-postgres:
+    image: postgres:14-alpine
+    container_name: authentik-postgres
+    restart: unless-stopped
     environment:
-      - WEBSOCKET_ENABLED=true
-      - SIGNUPS_ALLOWED=false # Set to true initially, then false
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_USER=authentik
+      - POSTGRES_DB=authentik
     volumes:
-      - vaultwarden_data:/data # Changed to named volume
+      - authentik_postgres_data:/var/lib/postgresql/data
+    networks:
+      - authentik_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+
+  authentik-redis:
+    image: redis:alpine
+    container_name: authentik-redis
+    restart: unless-stopped
+    command: --save 60 1 --loglevel warning
+    volumes:
+      - authentik_redis_data:/data
+    networks:
+      - authentik_network
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 3s
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:latest
+    container_name: authentik-server
+    restart: unless-stopped
+    command: server
+    environment:
+      - AUTHENTIK_REDIS__HOST=authentik-redis
+      - AUTHENTIK_POSTGRESQL__HOST=authentik-postgres
+      - AUTHENTIK_POSTGRESQL__USER=authentik
+      - AUTHENTIK_POSTGRESQL__NAME=authentik
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRES_PASSWORD}
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY}
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+      - AUTHENTIK_DISABLE_UPDATE_CHECK=true
+      - AUTHENTIK_DISABLE_STARTUP_ANALYTICS=true
+      - AUTHENTIK_AVATARS=initials
+      - AUTHENTIK_DEFAULT_USER_CHANGE_NAME=true
+      - AUTHENTIK_DEFAULT_USER_CHANGE_EMAIL=true
+      - AUTHENTIK_DEFAULT_USER_CHANGE_USERNAME=true
+      - AUTHENTIK_GDPR_COMPLIANCE=true
+      - AUTHENTIK_DEFAULT_TOKEN_DURATION=minutes=30
+      - AUTHENTIK_DEFAULT_TOKEN_LENGTH=128
+    volumes:
+      - authentik_media:/media
+      - authentik_custom_templates:/templates
+    depends_on:
+      - authentik-postgres
+      - authentik-redis
+    networks:
+      - authentik_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.authentik.rule=Host(`${PRIMARY_DOMAIN}`) && PathPrefix(`/login`) || Host(`${SECONDARY_DOMAIN}`) && PathPrefix(`/login`)"
+      - "traefik.http.routers.authentik.tls=true"
+      - "traefik.http.routers.authentik.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.authentik.loadbalancer.server.port=9000"
+      - "traefik.http.routers.authentik.middlewares=authentik-headers"
+      - "traefik.http.middlewares.authentik-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.authentik-headers.headers.customrequestheaders.X-Forwarded-Host=${PRIMARY_DOMAIN}"
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:latest
+    container_name: authentik-worker
+    restart: unless-stopped
+    command: worker
+    environment:
+      - AUTHENTIK_REDIS__HOST=authentik-redis
+      - AUTHENTIK_POSTGRESQL__HOST=authentik-postgres
+      - AUTHENTIK_POSTGRESQL__USER=authentik
+      - AUTHENTIK_POSTGRESQL__NAME=authentik
+      - AUTHENTIK_POSTGRESQL__PASSWORD=${POSTGRES_PASSWORD}
+      - AUTHENTIK_SECRET_KEY=${AUTHENTIK_SECRET_KEY}
+      - AUTHENTIK_ERROR_REPORTING__ENABLED=false
+      - AUTHENTIK_DISABLE_UPDATE_CHECK=true
+      - AUTHENTIK_DISABLE_STARTUP_ANALYTICS=true
+    volumes:
+      - authentik_media:/media
+      - authentik_custom_templates:/templates
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - authentik-postgres
+      - authentik-redis
+    networks:
+      - authentik_network
+
+  # =============================================================================
+  # TRIVY - Vulnerability Scanner
+  # =============================================================================
+  trivy:
+    image: aquasec/trivy:latest
+    container_name: trivy
+    restart: unless-stopped
+    environment:
+      - TRIVY_LISTEN=0.0.0.0:8080
+      - TRIVY_CACHE_DIR=/cache
+      - TRIVY_DB_REPOSITORY=${TRIVY_DB_REPOSITORY}
+      - TRIVY_JAVA_DB_REPOSITORY=${TRIVY_JAVA_DB_REPOSITORY}
+    volumes:
+      - trivy_cache:/cache
+      - trivy_db:/db
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: server --listen 0.0.0.0:8080
+    networks:
+      - security_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.trivy.rule=Host(`trivy.${PRIMARY_DOMAIN}`) || Host(`trivy.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.trivy.tls=true"
+      - "traefik.http.routers.trivy.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.trivy.loadbalancer.server.port=8080"
+
+  # =============================================================================
+  # FALCO - Runtime Security Monitoring
+  # =============================================================================
+  falco:
+    image: falcosecurity/falco-no-driver:latest
+    container_name: falco
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - FALCO_GRPC_ENABLED=true
+      - FALCO_GRPC_BIND_ADDRESS=0.0.0.0:5060
+      - FALCO_WEBSERVER_ENABLED=true
+      - FALCO_WEBSERVER_LISTEN_PORT=8765
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock:ro
+      - /dev:/host/dev:ro
+      - /proc:/host/proc:ro
+      - /boot:/host/boot:ro
+      - /lib/modules:/host/lib/modules:ro
+      - /usr:/host/usr:ro
+      - /etc:/host/etc:ro
+      - ./config/falco/falco.yaml:/etc/falco/falco.yaml:ro
+      - ./config/falco/rules:/etc/falco/rules:ro
+    networks:
+      - security_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.falco.rule=Host(`falco.${PRIMARY_DOMAIN}`) || Host(`falco.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.falco.tls=true"
+      - "traefik.http.routers.falco.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.falco.loadbalancer.server.port=8765"
+
+  # =============================================================================
+  # CLAMAV - Antivirus Scanner
+  # =============================================================================
+  clamav:
+    image: clamav/clamav:latest
+    container_name: clamav
+    restart: unless-stopped
+    environment:
+      - CLAMAV_NO_FRESHCLAMD=false
+      - CLAMAV_NO_CLAMD=false
+      - CLAMAV_NO_MILTERD=true
+    volumes:
+      - clamav_data:/var/lib/clamav
+      - ${MEDIA_BASE_PATH}:/scan:ro
     networks:
       - security_network
 
+  # =============================================================================
+  # FAIL2BAN - Intrusion Prevention
+  # =============================================================================
+  fail2ban:
+    image: crazymax/fail2ban:latest
+    container_name: fail2ban
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - F2B_LOG_TARGET=STDOUT
+      - F2B_LOG_LEVEL=INFO
+      - F2B_DB_PURGE_AGE=30d
+    volumes:
+      - fail2ban_data:/data
+      - /var/log:/var/log:ro
+      - ./config/fail2ban:/etc/fail2ban:ro
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    depends_on:
+      - authentik-server
+
+  # =============================================================================
+  # OAUTH2-PROXY - Authentication Gateway
+  # =============================================================================
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:latest
+    container_name: oauth2-proxy
+    restart: unless-stopped
+    environment:
+      - OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:4180
+      - OAUTH2_PROXY_UPSTREAMS=static://202
+      - OAUTH2_PROXY_EMAIL_DOMAINS=*
+      - OAUTH2_PROXY_CLIENT_ID=oauth2-proxy
+      - OAUTH2_PROXY_CLIENT_SECRET=${AUTHENTIK_SECRET_KEY}
+      - OAUTH2_PROXY_COOKIE_SECRET=${AUTHENTIK_BOOTSTRAP_TOKEN}
+      - OAUTH2_PROXY_OIDC_ISSUER_URL=https://${PRIMARY_DOMAIN}/login/application/o/oauth2-proxy/
+      - OAUTH2_PROXY_REDIRECT_URL=https://auth.${PRIMARY_DOMAIN}/oauth2/callback
+      - OAUTH2_PROXY_OIDC_EXTRA_AUDIENCES=oauth2-proxy
+      - OAUTH2_PROXY_PROVIDER=oidc
+      - OAUTH2_PROXY_SCOPE=openid profile email
+      - OAUTH2_PROXY_CODE_CHALLENGE_METHOD=S256
+    depends_on:
+      - authentik-server
+    networks:
+      - security_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.oauth2-proxy.rule=Host(`auth.${PRIMARY_DOMAIN}`) || Host(`auth.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.oauth2-proxy.tls=true"
+      - "traefik.http.routers.oauth2-proxy.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.oauth2-proxy.loadbalancer.server.port=4180"
+
+  # =============================================================================
+  # CROWDSEC - Collaborative Security Engine
+  # =============================================================================
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    restart: unless-stopped
+    environment:
+      - COLLECTIONS=crowdsecurity/traefik crowdsecurity/http-cve crowdsecurity/whitelist-good-actors
+      - GID=${PGID:-1000}
+    volumes:
+      - crowdsec_config:/etc/crowdsec
+      - crowdsec_data:/var/lib/crowdsec/data
+      - /var/log:/var/log:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - security_network
+
+  # =============================================================================
+  # WAZUH MANAGER - Security Information & Event Management
+  # =============================================================================
   wazuh-manager:
+    image: wazuh/wazuh-manager:latest
     container_name: wazuh-manager
-    image: wazuh/wazuh-manager:latest # Pin a specific version, e.g., 4.7.2
-    hostname: wazuh-manager
-    restart: always
-    ports:
-      - "${WAZUH_MANAGER_API_PORT}:55000/tcp"
-      - "1514:1514/udp"
-      - "1515:1515/tcp"
+    restart: unless-stopped
     environment:
-      WAZUH_PATH: "/var/ossec"
-      DISABLE_SSL: "true" # Keep for testing, but secure in production!
+      - INDEXER_URL=https://wazuh-indexer:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${USER_PASSWORD}
+      - FILEBEAT_SSL_VERIFICATION_MODE=full
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat.key
     volumes:
-      - wazuh_manager_data:/var/ossec # Changed to named volume
-      - wazuh_manager_certs:/usr/share/filebeat/certs # Changed to named volume
+      - wazuh_manager_config:/wazuh-config-mount/etc/ossec.conf
+      - wazuh_manager_logs:/var/ossec/logs
+      - wazuh_manager_queue:/var/ossec/queue
+      - wazuh_manager_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_manager_integrations:/var/ossec/integrations
+      - wazuh_manager_active_response:/var/ossec/active-response/bin
+      - wazuh_manager_agentless:/var/ossec/agentless
+      - wazuh_manager_wodles:/var/ossec/wodles
+      - wazuh_filebeat_etc:/etc/filebeat
+      - wazuh_filebeat_var:/var/lib/filebeat
     networks:
-      - wazuh_network
+      - security_network
 
-  wazuh-indexer:
-    container_name: wazuh-indexer
-    image: opensearchproject/opensearch:2.11.1
-    hostname: wazuh-indexer
-    restart: always
+  # =============================================================================
+  # SECURITY SCANNER - Custom Security Automation
+  # =============================================================================
+  security-scanner:
+    image: python:3.11-slim
+    container_name: security-scanner
+    restart: unless-stopped
     environment:
-      - node.name=wazuh-indexer
-      - cluster.name=wazuh-cluster
-      - discovery.type=single-node
-      - bootstrap.memory_lock=true
-      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
-      - DISABLE_SECURITY_PLUGIN=true # Keep for testing, secure in production!
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
+      - TRIVY_URL=http://trivy:8080
+      - FALCO_URL=http://falco:8765
+      - NOTIFICATION_URL=http://ntfy:80
     volumes:
-      - wazuh_indexer_data:/usr/share/opensearch/data # Changed to named volume
-    ports:
-      - "${WAZUH_INDEXER_PORT}:9200"
+      - ./scripts/security-scanner:/app
+      - security_scanner_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    working_dir: /app
+    command: python scanner.py
+    depends_on:
+      - trivy
+      - falco
     networks:
-      - wazuh_network
+      - security_network
+      - notifications_network
 
-  wazuh-dashboard:
-    container_name: wazuh-dashboard
-    image: wazuh/wazuh-dashboard:4.7.2
-    hostname: wazuh-dashboard
-    restart: always
-    ports:
-      - "${WAZUH_DASHBOARD_PORT}:5601"
-    environment:
-      SERVER_HOST: "0.0.0.0"
-      OPENSEARCH_HOSTS: '["https://wazuh-indexer:9200"]'
-      WAZUH_MANAGER_HOST: "wazuh-manager"
-      TZ: ${TZ} # Inherited from .env
-      OPENSEARCH_SSL_VERIFY: "false"
-      OPENSEARCH_REQUEST_TIMEOUT: "90000"
-      WAZUH_MANAGER_SSL_VERIFY: "false"
-      WAZUH_MANAGER_TIMEOUT: "90000"
-    volumes:
-      - wazuh_dashboard_data:/usr/share/wazuh-dashboard/data # Changed to named volume
-    networks:
-      - wazuh_network
-
+# =============================================================================
+# NETWORKS
+# =============================================================================
 networks:
+  authentik_network:
+    driver: bridge
+    internal: false
   security_network:
+    driver: bridge
+    internal: false
+  proxy_network:
     external: true
-  wazuh_network:
+  notifications_network:
     external: true
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  # Authentik
+  authentik_postgres_data:
+  authentik_redis_data:
+  authentik_media:
+  authentik_custom_templates:
+  
+  # Security Tools
+  trivy_cache:
+  trivy_db:
+  clamav_data:
+  fail2ban_data:
+  crowdsec_config:
+  crowdsec_data:
+  
+  # Wazuh
+  wazuh_manager_config:
+  wazuh_manager_logs:
+  wazuh_manager_queue:
+  wazuh_manager_var_multigroups:
+  wazuh_manager_integrations:
+  wazuh_manager_active_response:
+  wazuh_manager_agentless:
+  wazuh_manager_wodles:
+  wazuh_filebeat_etc:
+  wazuh_filebeat_var:
+  
+  # Custom Scripts
+  security_scanner_data:
+

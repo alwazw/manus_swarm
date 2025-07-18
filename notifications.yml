@@ -1,0 +1,310 @@
+# Notifications & Alert Management Stack
+# Multi-channel notification system
+
+services:
+  # =============================================================================
+  # NTFY - Self-hosted Push Notifications
+  # =============================================================================
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    restart: unless-stopped
+    environment:
+      - NTFY_BASE_URL=https://${NTFY_SUBDOMAIN}.${PRIMARY_DOMAIN}
+      - NTFY_UPSTREAM_BASE_URL=https://ntfy.sh
+      - NTFY_LISTEN_HTTP=:80
+      - NTFY_BEHIND_PROXY=true
+      - NTFY_AUTH_FILE=/var/lib/ntfy/user.db
+      - NTFY_AUTH_DEFAULT_ACCESS=deny-all
+      - NTFY_ENABLE_SIGNUP=true
+      - NTFY_ENABLE_LOGIN=true
+      - NTFY_ENABLE_RESERVATIONS=true
+    volumes:
+      - ntfy_data:/var/lib/ntfy
+      - ./config/ntfy/server.yml:/etc/ntfy/server.yml:ro
+    command: serve
+    networks:
+      - notifications_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ntfy.rule=Host(`${NTFY_SUBDOMAIN}.${PRIMARY_DOMAIN}`) || Host(`${NTFY_SUBDOMAIN}.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.ntfy.tls=true"
+      - "traefik.http.routers.ntfy.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.ntfy.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # GOTIFY - Alternative Notification Server
+  # =============================================================================
+  gotify:
+    image: gotify/server:latest
+    container_name: gotify
+    restart: unless-stopped
+    environment:
+      - GOTIFY_DEFAULTUSER_PASS=${USER_PASSWORD}
+      - GOTIFY_PASSSTRENGTH=8
+      - GOTIFY_UPLOADEDIMAGESDIR=/app/data/images
+      - GOTIFY_PLUGINSDIR=/app/data/plugins
+      - GOTIFY_REGISTRATION=false
+    volumes:
+      - gotify_data:/app/data
+    networks:
+      - notifications_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gotify.rule=Host(`gotify.${PRIMARY_DOMAIN}`) || Host(`gotify.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.gotify.tls=true"
+      - "traefik.http.routers.gotify.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.gotify.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # APPRISE - Universal Notification Gateway
+  # =============================================================================
+  apprise:
+    image: caronc/apprise:latest
+    container_name: apprise
+    restart: unless-stopped
+    environment:
+      - APPRISE_STATEFUL_MODE=yes
+      - APPRISE_CONFIG_LOCK=yes
+    volumes:
+      - apprise_data:/config
+      - ./config/apprise:/etc/apprise:ro
+    networks:
+      - notifications_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.apprise.rule=Host(`apprise.${PRIMARY_DOMAIN}`) || Host(`apprise.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.apprise.tls=true"
+      - "traefik.http.routers.apprise.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.apprise.loadbalancer.server.port=8000"
+
+  # =============================================================================
+  # WEBHOOK RELAY - Custom Webhook Integrations
+  # =============================================================================
+  webhook-relay:
+    image: webhookrelay/webhookrelayd:latest
+    container_name: webhook-relay
+    restart: unless-stopped
+    environment:
+      - KEY=${AUTHENTIK_SECRET_KEY}
+      - SECRET=${AUTHENTIK_BOOTSTRAP_TOKEN}
+    volumes:
+      - webhook_relay_data:/data
+    networks:
+      - notifications_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.webhook.rule=Host(`webhook.${PRIMARY_DOMAIN}`) || Host(`webhook.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.webhook.tls=true"
+      - "traefik.http.routers.webhook.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.webhook.loadbalancer.server.port=9090"
+
+  # =============================================================================
+  # MAILHOG - Email Testing & Development
+  # =============================================================================
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: mailhog
+    restart: unless-stopped
+    environment:
+      - MH_STORAGE=maildir
+      - MH_MAILDIR_PATH=/maildir
+    volumes:
+      - mailhog_data:/maildir
+    networks:
+      - notifications_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.mailhog.rule=Host(`mail.${PRIMARY_DOMAIN}`) || Host(`mail.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.mailhog.tls=true"
+      - "traefik.http.routers.mailhog.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.mailhog.loadbalancer.server.port=8025"
+
+  # =============================================================================
+  # POSTFIX - SMTP Server
+  # =============================================================================
+  postfix:
+    image: catatnight/postfix:latest
+    container_name: postfix
+    restart: unless-stopped
+    environment:
+      - maildomain=${PRIMARY_DOMAIN}
+      - smtp_user=${USERNAME}:${USER_PASSWORD}
+    volumes:
+      - postfix_data:/var/spool/postfix
+    networks:
+      - notifications_network
+
+  # =============================================================================
+  # MATRIX SYNAPSE - Matrix Chat Server
+  # =============================================================================
+  matrix-synapse:
+    image: matrixdotorg/synapse:latest
+    container_name: matrix-synapse
+    restart: unless-stopped
+    environment:
+      - SYNAPSE_SERVER_NAME=${PRIMARY_DOMAIN}
+      - SYNAPSE_REPORT_STATS=no
+      - SYNAPSE_ENABLE_REGISTRATION=true
+      - SYNAPSE_LOG_LEVEL=INFO
+    volumes:
+      - matrix_data:/data
+      - ./config/matrix/homeserver.yaml:/data/homeserver.yaml:ro
+    depends_on:
+      - matrix-postgres
+    networks:
+      - notifications_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.matrix.rule=Host(`matrix.${PRIMARY_DOMAIN}`) || Host(`matrix.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.matrix.tls=true"
+      - "traefik.http.routers.matrix.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.matrix.loadbalancer.server.port=8008"
+
+  # Matrix Database
+  matrix-postgres:
+    image: postgres:14-alpine
+    container_name: matrix-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=synapse
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=synapse
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - matrix_postgres_data:/var/lib/postgresql/data
+    networks:
+      - notifications_network
+
+  # =============================================================================
+  # ELEMENT WEB - Matrix Web Client
+  # =============================================================================
+  element-web:
+    image: vectorim/element-web:latest
+    container_name: element-web
+    restart: unless-stopped
+    volumes:
+      - ./config/element/config.json:/app/config.json:ro
+    depends_on:
+      - matrix-synapse
+    networks:
+      - notifications_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.element.rule=Host(`chat.${PRIMARY_DOMAIN}`) || Host(`chat.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.element.tls=true"
+      - "traefik.http.routers.element.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.element.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # DISCORD BOT - Discord Notifications
+  # =============================================================================
+  discord-bot:
+    image: python:3.11-slim
+    container_name: discord-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID:-}
+    volumes:
+      - ./scripts/discord-bot:/app
+    working_dir: /app
+    command: python bot.py
+    networks:
+      - notifications_network
+    profiles:
+      - discord
+
+  # =============================================================================
+  # SLACK BOT - Slack Notifications
+  # =============================================================================
+  slack-bot:
+    image: python:3.11-slim
+    container_name: slack-bot
+    restart: unless-stopped
+    environment:
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_CHANNEL=${SLACK_CHANNEL:-}
+    volumes:
+      - ./scripts/slack-bot:/app
+    working_dir: /app
+    command: python bot.py
+    networks:
+      - notifications_network
+    profiles:
+      - slack
+
+  # =============================================================================
+  # TELEGRAM BOT - Telegram Notifications
+  # =============================================================================
+  telegram-bot:
+    image: python:3.11-slim
+    container_name: telegram-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./scripts/telegram-bot:/app
+    working_dir: /app
+    command: python bot.py
+    networks:
+      - notifications_network
+    profiles:
+      - telegram
+
+  # =============================================================================
+  # NOTIFICATION AGGREGATOR - Custom Alert Handler
+  # =============================================================================
+  notification-aggregator:
+    image: python:3.11-slim
+    container_name: notification-aggregator
+    restart: unless-stopped
+    environment:
+      - NTFY_URL=http://ntfy:80
+      - GOTIFY_URL=http://gotify:80
+      - GOTIFY_TOKEN=${USER_PASSWORD}
+      - APPRISE_URL=http://apprise:8000
+    volumes:
+      - ./scripts/notification-aggregator:/app
+      - notification_aggregator_data:/data
+    working_dir: /app
+    command: python aggregator.py
+    depends_on:
+      - ntfy
+      - gotify
+      - apprise
+    networks:
+      - notifications_network
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  notifications_network:
+    driver: bridge
+    internal: false
+  proxy_network:
+    external: true
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  ntfy_data:
+  gotify_data:
+  apprise_data:
+  webhook_relay_data:
+  mailhog_data:
+  postfix_data:
+  matrix_data:
+  matrix_postgres_data:
+  notification_aggregator_data:
+

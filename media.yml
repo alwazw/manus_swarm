@@ -1,24 +1,404 @@
-# media.yml
-version: '3.8'
+# Media & File Synchronization Stack
+# Complete replacement for OneDrive, iCloud, Google Drive
 
 services:
-  plex:
-    <<: *default-app-config # Extend common settings
-    container_name: plex
-    image: lscr.io/linuxserver/plex:latest
-    ports:
-      - "${PLEX_PORT}:32400"
+  # =============================================================================
+  # NEXTCLOUD - Primary Cloud Storage & Sync
+  # =============================================================================
+  nextcloud:
+    image: nextcloud:latest
+    container_name: nextcloud
+    restart: unless-stopped
     environment:
-      VERSION: docker
+      - MYSQL_HOST=nextcloud-db
+      - MYSQL_DATABASE=nextcloud
+      - MYSQL_USER=nextcloud
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER}
+      - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD}
+      - NEXTCLOUD_TRUSTED_DOMAINS=${NEXTCLOUD_SUBDOMAIN}.${PRIMARY_DOMAIN} ${NEXTCLOUD_SUBDOMAIN}.${SECONDARY_DOMAIN} ${HOST_IP}
+      - OVERWRITEPROTOCOL=https
+      - OVERWRITEHOST=${NEXTCLOUD_SUBDOMAIN}.${PRIMARY_DOMAIN}
+      - OVERWRITECLIURL=https://${NEXTCLOUD_SUBDOMAIN}.${PRIMARY_DOMAIN}
+      - APACHE_DISABLE_REWRITE_IP=1
+      - TRUSTED_PROXIES=traefik
     volumes:
-      - plex_config:/config # Changed to named volume
-      # These remain bind mounts for your existing media library, which is outside Docker's managed volumes
-      - ${MEDIA_PATH}/tvseries:/tv:rslave # rslave for FUSE mounts
-      - ${MEDIA_PATH}/movies:/movies:rslave # rslave for FUSE mounts
+      - nextcloud_data:/var/www/html
+      - ${NEXTCLOUD_DATA_PATH}:/var/www/html/data
+      - ${MEDIA_PHOTOS_PATH}:/var/www/html/data/photos
+      - ${MEDIA_DOCUMENTS_PATH}:/var/www/html/data/documents
+      - ${MEDIA_VIDEOS_PATH}:/var/www/html/data/videos
+      - ${MEDIA_MUSIC_PATH}:/var/www/html/data/music
+      - ${MEDIA_BOOKS_PATH}:/var/www/html/data/books
+    depends_on:
+      - nextcloud-db
+      - nextcloud-redis
+    networks:
+      - nextcloud_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nextcloud.rule=Host(`${NEXTCLOUD_SUBDOMAIN}.${PRIMARY_DOMAIN}`) || Host(`${NEXTCLOUD_SUBDOMAIN}.${SECONDARY_DOMAIN}`) || Host(`${HOST_IP}`) && PathPrefix(`/nextcloud`)"
+      - "traefik.http.routers.nextcloud.tls=true"
+      - "traefik.http.routers.nextcloud.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+      - "traefik.http.routers.nextcloud.middlewares=nextcloud-headers"
+      - "traefik.http.middlewares.nextcloud-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.nextcloud-headers.headers.customrequestheaders.X-Forwarded-Host=${NEXTCLOUD_SUBDOMAIN}.${PRIMARY_DOMAIN}"
+
+  # Nextcloud Database
+  nextcloud-db:
+    image: mariadb:latest
+    container_name: nextcloud-db
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=nextcloud
+      - MYSQL_USER=nextcloud
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+    volumes:
+      - nextcloud_db_data:/var/lib/mysql
+    networks:
+      - nextcloud_network
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW --innodb-file-per-table=1 --skip-innodb-read-only-compressed
+
+  # Nextcloud Redis Cache
+  nextcloud-redis:
+    image: redis:alpine
+    container_name: nextcloud-redis
+    restart: unless-stopped
+    networks:
+      - nextcloud_network
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+
+  # =============================================================================
+  # SYNCTHING - Peer-to-Peer File Synchronization
+  # =============================================================================
+  syncthing:
+    image: lscr.io/linuxserver/syncthing:latest
+    container_name: syncthing
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - syncthing_config:/config
+      - ${MEDIA_BASE_PATH}:/data
+      - ${MEDIA_PHOTOS_PATH}:/data/photos
+      - ${MEDIA_DOCUMENTS_PATH}:/data/documents
+      - ${MEDIA_VIDEOS_PATH}:/data/videos
+      - ${MEDIA_MUSIC_PATH}:/data/music
+      - ${MEDIA_DOWNLOADS_PATH}:/data/downloads
+    ports:
+      - "${SYNCTHING_GUI_PORT}:8384"
+      - "${SYNCTHING_LISTEN_PORT}:22000/tcp"
+      - "${SYNCTHING_LISTEN_PORT}:22000/udp"
+      - "${SYNCTHING_DISCOVERY_PORT}:21027/udp"
+    networks:
+      - media_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.syncthing.rule=Host(`sync.${PRIMARY_DOMAIN}`) || Host(`sync.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.syncthing.tls=true"
+      - "traefik.http.routers.syncthing.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.syncthing.loadbalancer.server.port=8384"
+
+  # =============================================================================
+  # PLEX - Media Server
+  # =============================================================================
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+      - VERSION=docker
+      - PLEX_CLAIM= # Optional: Get from https://plex.tv/claim
+    volumes:
+      - plex_config:/config
+      - ${MEDIA_TV_SERIES_PATH}:/tv
+      - ${MEDIA_MOVIES_PATH}:/movies
+      - ${MEDIA_MUSIC_PATH}:/music
+      - ${MEDIA_PHOTOS_PATH}:/photos
+    ports:
+      - "32400:32400"
+      - "1900:1900/udp"
+      - "3005:3005"
+      - "5353:5353/udp"
+      - "8324:8324"
+      - "32410:32410/udp"
+      - "32412:32412/udp"
+      - "32413:32413/udp"
+      - "32414:32414/udp"
+      - "32469:32469"
+    networks:
+      - media_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.plex.rule=Host(`${PLEX_SUBDOMAIN}.${PRIMARY_DOMAIN}`) || Host(`${PLEX_SUBDOMAIN}.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.plex.tls=true"
+      - "traefik.http.routers.plex.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.plex.loadbalancer.server.port=32400"
+
+  # =============================================================================
+  # JELLYFIN - Alternative Media Server
+  # =============================================================================
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - jellyfin_config:/config
+      - ${MEDIA_TV_SERIES_PATH}:/data/tvshows
+      - ${MEDIA_MOVIES_PATH}:/data/movies
+      - ${MEDIA_MUSIC_PATH}:/data/music
+    ports:
+      - "8096:8096"
+      - "8920:8920" # Optional HTTPS port
+      - "7359:7359/udp" # Optional auto-discovery
+      - "1900:1900/udp" # Optional DLNA
+    networks:
+      - media_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jellyfin.rule=Host(`jellyfin.${PRIMARY_DOMAIN}`) || Host(`jellyfin.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.jellyfin.tls=true"
+      - "traefik.http.routers.jellyfin.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.jellyfin.loadbalancer.server.port=8096"
+
+  # =============================================================================
+  # PHOTOPRISM - Photo Management & AI
+  # =============================================================================
+  photoprism:
+    image: photoprism/photoprism:latest
+    container_name: photoprism
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    environment:
+      - PHOTOPRISM_ADMIN_PASSWORD=${USER_PASSWORD}
+      - PHOTOPRISM_SITE_URL=https://photos.${PRIMARY_DOMAIN}/
+      - PHOTOPRISM_ORIGINALS_LIMIT=5000
+      - PHOTOPRISM_HTTP_COMPRESSION=gzip
+      - PHOTOPRISM_LOG_LEVEL=info
+      - PHOTOPRISM_READONLY=false
+      - PHOTOPRISM_EXPERIMENTAL=false
+      - PHOTOPRISM_DISABLE_CHOWN=false
+      - PHOTOPRISM_DISABLE_WEBDAV=false
+      - PHOTOPRISM_DISABLE_SETTINGS=false
+      - PHOTOPRISM_DISABLE_TENSORFLOW=false
+      - PHOTOPRISM_DISABLE_FACES=false
+      - PHOTOPRISM_DISABLE_CLASSIFICATION=false
+      - PHOTOPRISM_DISABLE_RAW=false
+      - PHOTOPRISM_RAW_PRESETS=false
+      - PHOTOPRISM_JPEG_QUALITY=85
+      - PHOTOPRISM_DETECT_NSFW=false
+      - PHOTOPRISM_UPLOAD_NSFW=true
+      - PHOTOPRISM_DATABASE_DRIVER=mysql
+      - PHOTOPRISM_DATABASE_SERVER=photoprism-db:3306
+      - PHOTOPRISM_DATABASE_NAME=photoprism
+      - PHOTOPRISM_DATABASE_USER=photoprism
+      - PHOTOPRISM_DATABASE_PASSWORD=${MYSQL_PASSWORD}
+      - PHOTOPRISM_SITE_CAPTION=AI-Powered Photos
+      - PHOTOPRISM_SITE_DESCRIPTION=Browse Your Life in Pictures
+      - PHOTOPRISM_SITE_AUTHOR=${USERNAME}
+    volumes:
+      - ${MEDIA_PHOTOS_PATH}:/photoprism/originals
+      - photoprism_storage:/photoprism/storage
+    depends_on:
+      - photoprism-db
+    networks:
+      - media_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.photoprism.rule=Host(`photos.${PRIMARY_DOMAIN}`) || Host(`photos.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.photoprism.tls=true"
+      - "traefik.http.routers.photoprism.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.photoprism.loadbalancer.server.port=2342"
+
+  # PhotoPrism Database
+  photoprism-db:
+    image: mariadb:latest
+    container_name: photoprism-db
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=photoprism
+      - MYSQL_USER=photoprism
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+    volumes:
+      - photoprism_db_data:/var/lib/mysql
+    networks:
+      - media_network
+    command: mysqld --innodb-buffer-pool-size=512M --transaction-isolation=READ-COMMITTED --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --max-connections=512 --innodb-rollback-on-timeout=OFF --innodb-lock-wait-timeout=120
+
+  # =============================================================================
+  # IMMICH - Modern Photo & Video Management
+  # =============================================================================
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:release
+    container_name: immich-server
+    restart: unless-stopped
+    environment:
+      - DB_HOSTNAME=immich-postgres
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_DATABASE_NAME=immich
+      - REDIS_HOSTNAME=immich-redis
+      - UPLOAD_LOCATION=${MEDIA_PHOTOS_PATH}/immich
+    volumes:
+      - ${MEDIA_PHOTOS_PATH}:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - immich-redis
+      - immich-postgres
+    networks:
+      - media_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.immich.rule=Host(`immich.${PRIMARY_DOMAIN}`) || Host(`immich.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.immich.tls=true"
+      - "traefik.http.routers.immich.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.immich.loadbalancer.server.port=3001"
+
+  # Immich Machine Learning
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    container_name: immich-machine-learning
+    restart: unless-stopped
+    volumes:
+      - immich_model_cache:/cache
     networks:
       - media_network
 
+  # Immich Redis
+  immich-redis:
+    image: redis:alpine
+    container_name: immich-redis
+    restart: unless-stopped
+    networks:
+      - media_network
+
+  # Immich Database
+  immich-postgres:
+    image: postgres:14-alpine
+    container_name: immich-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=immich
+    volumes:
+      - immich_postgres_data:/var/lib/postgresql/data
+    networks:
+      - media_network
+
+  # =============================================================================
+  # FILEBROWSER - Web File Manager
+  # =============================================================================
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    restart: unless-stopped
+    environment:
+      - FB_BASEURL=/files
+    volumes:
+      - ${MEDIA_BASE_PATH}:/srv
+      - filebrowser_config:/config
+      - filebrowser_database:/database
+    networks:
+      - media_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.filebrowser.rule=Host(`files.${PRIMARY_DOMAIN}`) || Host(`files.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.filebrowser.tls=true"
+      - "traefik.http.routers.filebrowser.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.filebrowser.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # DUPLICATI - Backup Solution
+  # =============================================================================
+  duplicati:
+    image: lscr.io/linuxserver/duplicati:latest
+    container_name: duplicati
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - duplicati_config:/config
+      - ${MEDIA_BASE_PATH}:/source
+      - ${BACKUP_LOCAL_PATH}:/backups
+    networks:
+      - media_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.duplicati.rule=Host(`backup.${PRIMARY_DOMAIN}`) || Host(`backup.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.duplicati.tls=true"
+      - "traefik.http.routers.duplicati.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.duplicati.loadbalancer.server.port=8200"
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
 networks:
+  nextcloud_network:
+    driver: bridge
+    internal: false
   media_network:
+    driver: bridge
+    internal: false
+  proxy_network:
     external: true
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  # Nextcloud
+  nextcloud_data:
+  nextcloud_db_data:
+  
+  # Syncthing
+  syncthing_config:
+  
+  # Plex
+  plex_config:
+  
+  # Jellyfin
+  jellyfin_config:
+  
+  # PhotoPrism
+  photoprism_storage:
+  photoprism_db_data:
+  
+  # Immich
+  immich_model_cache:
+  immich_postgres_data:
+  
+  # FileBrowser
+  filebrowser_config:
+  filebrowser_database:
+  
+  # Duplicati
+  duplicati_config:
 

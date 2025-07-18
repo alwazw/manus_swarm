@@ -1,0 +1,264 @@
+# Reverse Proxy & SSL Stack
+# Traefik-based reverse proxy with automatic SSL
+
+services:
+  # =============================================================================
+  # TRAEFIK - Cloud-Native Reverse Proxy
+  # =============================================================================
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      # API and Dashboard
+      - --api.dashboard=true
+      - --api.debug=true
+      - --api.insecure=false
+      
+      # Entry Points
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.traefik.address=:8080
+      
+      # Providers
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=proxy_network
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      
+      # Certificate Resolvers
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.caserver=https://acme-v02.api.letsencrypt.org/directory
+      
+      # Global Redirect HTTP to HTTPS
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+      
+      # Logging
+      - --log.level=INFO
+      - --accesslog=true
+      - --accesslog.filepath=/var/log/traefik/access.log
+      - --log.filepath=/var/log/traefik/traefik.log
+      
+      # Metrics
+      - --metrics.prometheus=true
+      - --metrics.prometheus.addEntryPointsLabels=true
+      - --metrics.prometheus.addServicesLabels=true
+      - --entrypoints.metrics.address=:8082
+      - --metrics.prometheus.entryPoint=metrics
+      
+      # Pilot (optional)
+      - --pilot.dashboard=false
+      
+    ports:
+      - "${TRAEFIK_HTTP_PORT}:80"
+      - "${TRAEFIK_HTTPS_PORT}:443"
+      - "${TRAEFIK_DASHBOARD_PORT}:8080"
+      - "8082:8082" # Metrics
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_letsencrypt:/letsencrypt
+      - traefik_logs:/var/log/traefik
+      - ./config/traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./config/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+    networks:
+      - proxy_network
+    environment:
+      - CF_API_EMAIL=${LETSENCRYPT_EMAIL}
+      - CF_API_KEY=${CLOUDFLARE_API_KEY:-}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${PRIMARY_DOMAIN}`) || Host(`traefik.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.traefik.tls=true"
+      - "traefik.http.routers.traefik.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.services.traefik.loadbalancer.server.port=8080"
+      
+      # Middleware for authentication
+      - "traefik.http.routers.traefik.middlewares=traefik-auth"
+      - "traefik.http.middlewares.traefik-auth.basicauth.users=${USERNAME}:$$2y$$10$$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi" # admin:secret
+
+  # =============================================================================
+  # NGINX - Alternative Web Server & Load Balancer
+  # =============================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    restart: unless-stopped
+    volumes:
+      - nginx_config:/etc/nginx/conf.d
+      - nginx_html:/usr/share/nginx/html
+      - nginx_logs:/var/log/nginx
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/sites:/etc/nginx/sites-available:ro
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nginx.rule=Host(`nginx.${PRIMARY_DOMAIN}`) || Host(`nginx.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.nginx.tls=true"
+      - "traefik.http.routers.nginx.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.nginx.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # CLOUDFLARE TUNNEL - Alternative Access Method
+  # =============================================================================
+  cloudflare-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflare-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      - proxy_network
+    profiles:
+      - cloudflare
+
+  # =============================================================================
+  # CERT-MANAGER - Certificate Management (Alternative)
+  # =============================================================================
+  cert-manager:
+    image: quay.io/jetstack/cert-manager-controller:latest
+    container_name: cert-manager
+    restart: unless-stopped
+    environment:
+      - CERT_MANAGER_NAMESPACE=default
+    volumes:
+      - cert_manager_data:/var/lib/cert-manager
+      - ./config/cert-manager:/etc/cert-manager:ro
+    networks:
+      - proxy_network
+    profiles:
+      - cert-manager
+
+  # =============================================================================
+  # WHOAMI - Test Service for Traefik
+  # =============================================================================
+  whoami:
+    image: traefik/whoami:latest
+    container_name: whoami
+    restart: unless-stopped
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.whoami.rule=Host(`whoami.${PRIMARY_DOMAIN}`) || Host(`whoami.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.whoami.tls=true"
+      - "traefik.http.routers.whoami.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.whoami.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # HEIMDALL - Application Dashboard
+  # =============================================================================
+  heimdall:
+    image: lscr.io/linuxserver/heimdall:latest
+    container_name: heimdall
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - heimdall_config:/config
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.heimdall.rule=Host(`${DASHBOARD_SUBDOMAIN}.${PRIMARY_DOMAIN}`) || Host(`${DASHBOARD_SUBDOMAIN}.${SECONDARY_DOMAIN}`) || Host(`${PRIMARY_DOMAIN}`) || Host(`${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.heimdall.tls=true"
+      - "traefik.http.routers.heimdall.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.heimdall.loadbalancer.server.port=80"
+      - "traefik.http.routers.heimdall.priority=1"
+
+  # =============================================================================
+  # HOMEPAGE - Alternative Dashboard
+  # =============================================================================
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - homepage_config:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.homepage.rule=Host(`home.${PRIMARY_DOMAIN}`) || Host(`home.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.homepage.tls=true"
+      - "traefik.http.routers.homepage.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.homepage.loadbalancer.server.port=3000"
+
+  # =============================================================================
+  # ORGANIZR - Media Dashboard
+  # =============================================================================
+  organizr:
+    image: organizr/organizr:latest
+    container_name: organizr
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - organizr_config:/config
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.organizr.rule=Host(`organizr.${PRIMARY_DOMAIN}`) || Host(`organizr.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.organizr.tls=true"
+      - "traefik.http.routers.organizr.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.organizr.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # FLAME - Minimalist Dashboard
+  # =============================================================================
+  flame:
+    image: pawelmalak/flame:latest
+    container_name: flame
+    restart: unless-stopped
+    environment:
+      - PASSWORD=${USER_PASSWORD}
+      - PASSWORD_CONFIRM=${USER_PASSWORD}
+    volumes:
+      - flame_data:/app/data
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.flame.rule=Host(`flame.${PRIMARY_DOMAIN}`) || Host(`flame.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.flame.tls=true"
+      - "traefik.http.routers.flame.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.flame.loadbalancer.server.port=5005"
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  proxy_network:
+    driver: bridge
+    name: proxy_network
+    external: false
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  traefik_letsencrypt:
+  traefik_logs:
+  nginx_config:
+  nginx_html:
+  nginx_logs:
+  cert_manager_data:
+  heimdall_config:
+  homepage_config:
+  organizr_config:
+  flame_data:
+

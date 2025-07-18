@@ -1,7 +1,6 @@
 
 
 # automation.yml
-version: '3.8'
 
 services:
   n8n:

@@ -1,0 +1,295 @@
+# File Synchronization Stack
+# Dedicated services for device synchronization and file management
+
+services:
+  # =============================================================================
+  # SYNCTHING - Primary P2P File Sync
+  # =============================================================================
+  syncthing:
+    image: lscr.io/linuxserver/syncthing:latest
+    container_name: syncthing
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - syncthing_config:/config
+      - ${MEDIA_BASE_PATH}:/data
+      - ${MEDIA_PHOTOS_PATH}:/sync/photos
+      - ${MEDIA_DOCUMENTS_PATH}:/sync/documents
+      - ${MEDIA_VIDEOS_PATH}:/sync/videos
+      - ${MEDIA_MUSIC_PATH}:/sync/music
+      - ${MEDIA_DOWNLOADS_PATH}:/sync/downloads
+    ports:
+      - "${SYNCTHING_GUI_PORT}:8384"
+      - "${SYNCTHING_LISTEN_PORT}:22000/tcp"
+      - "${SYNCTHING_LISTEN_PORT}:22000/udp"
+      - "${SYNCTHING_DISCOVERY_PORT}:21027/udp"
+    networks:
+      - sync_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.syncthing.rule=Host(`sync.${PRIMARY_DOMAIN}`) || Host(`sync.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.syncthing.tls=true"
+      - "traefik.http.routers.syncthing.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.syncthing.loadbalancer.server.port=8384"
+
+  # =============================================================================
+  # RESILIO SYNC - Alternative P2P Sync
+  # =============================================================================
+  resilio-sync:
+    image: lscr.io/linuxserver/resilio-sync:latest
+    container_name: resilio-sync
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - resilio_config:/config
+      - ${MEDIA_BASE_PATH}:/sync
+      - ${MEDIA_DOWNLOADS_PATH}:/downloads
+    ports:
+      - "${RESILIO_WEBUI_PORT}:8888"
+      - "${RESILIO_LISTENING_PORT}:55555"
+    networks:
+      - sync_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.resilio.rule=Host(`resilio.${PRIMARY_DOMAIN}`) || Host(`resilio.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.resilio.tls=true"
+      - "traefik.http.routers.resilio.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.resilio.loadbalancer.server.port=8888"
+
+  # =============================================================================
+  # SEAFILE - Enterprise File Sync & Share
+  # =============================================================================
+  seafile:
+    image: seafileltd/seafile-mc:latest
+    container_name: seafile
+    restart: unless-stopped
+    environment:
+      - DB_HOST=seafile-db
+      - DB_ROOT_PASSWD=${MYSQL_ROOT_PASSWORD}
+      - TIME_ZONE=${TZ}
+      - SEAFILE_ADMIN_EMAIL=${USER_EMAIL}
+      - SEAFILE_ADMIN_PASSWORD=${USER_PASSWORD}
+      - SEAFILE_SERVER_LETSENCRYPT=false
+      - SEAFILE_SERVER_HOSTNAME=seafile.${PRIMARY_DOMAIN}
+    volumes:
+      - seafile_data:/shared
+      - ${MEDIA_BASE_PATH}:/shared/seafile/seafile-data/library-template
+    depends_on:
+      - seafile-db
+      - seafile-memcached
+    networks:
+      - sync_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.seafile.rule=Host(`seafile.${PRIMARY_DOMAIN}`) || Host(`seafile.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.seafile.tls=true"
+      - "traefik.http.routers.seafile.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.seafile.loadbalancer.server.port=80"
+
+  # Seafile Database
+  seafile-db:
+    image: mariadb:latest
+    container_name: seafile-db
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_LOG_CONSOLE=true
+    volumes:
+      - seafile_db_data:/var/lib/mysql
+    networks:
+      - sync_network
+
+  # Seafile Cache
+  seafile-memcached:
+    image: memcached:alpine
+    container_name: seafile-memcached
+    restart: unless-stopped
+    entrypoint: memcached -m 256
+    networks:
+      - sync_network
+
+  # =============================================================================
+  # OWNCLOUD - Alternative Cloud Storage
+  # =============================================================================
+  owncloud:
+    image: owncloud/server:latest
+    container_name: owncloud
+    restart: unless-stopped
+    environment:
+      - OWNCLOUD_DOMAIN=owncloud.${PRIMARY_DOMAIN}
+      - OWNCLOUD_TRUSTED_DOMAINS=owncloud.${PRIMARY_DOMAIN},owncloud.${SECONDARY_DOMAIN}
+      - OWNCLOUD_DB_TYPE=mysql
+      - OWNCLOUD_DB_NAME=owncloud
+      - OWNCLOUD_DB_USERNAME=owncloud
+      - OWNCLOUD_DB_PASSWORD=${MYSQL_PASSWORD}
+      - OWNCLOUD_DB_HOST=owncloud-db
+      - OWNCLOUD_ADMIN_USERNAME=${USERNAME}
+      - OWNCLOUD_ADMIN_PASSWORD=${USER_PASSWORD}
+      - OWNCLOUD_MYSQL_UTF8MB4=true
+      - OWNCLOUD_REDIS_ENABLED=true
+      - OWNCLOUD_REDIS_HOST=owncloud-redis
+    volumes:
+      - owncloud_data:/mnt/data
+      - ${MEDIA_BASE_PATH}:/mnt/data/files/${USERNAME}/files/Media
+    depends_on:
+      - owncloud-db
+      - owncloud-redis
+    networks:
+      - sync_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.owncloud.rule=Host(`owncloud.${PRIMARY_DOMAIN}`) || Host(`owncloud.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.owncloud.tls=true"
+      - "traefik.http.routers.owncloud.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.owncloud.loadbalancer.server.port=8080"
+
+  # OwnCloud Database
+  owncloud-db:
+    image: mariadb:latest
+    container_name: owncloud-db
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_USER=owncloud
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=owncloud
+    volumes:
+      - owncloud_db_data:/var/lib/mysql
+    networks:
+      - sync_network
+    command: --max-allowed-packet=128M --innodb-log-file-size=64M
+
+  # OwnCloud Redis
+  owncloud-redis:
+    image: redis:alpine
+    container_name: owncloud-redis
+    restart: unless-stopped
+    networks:
+      - sync_network
+    command: ["--databases", "1"]
+
+  # =============================================================================
+  # FILEBROWSER - Web File Manager
+  # =============================================================================
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    restart: unless-stopped
+    environment:
+      - FB_BASEURL=/files
+    volumes:
+      - ${MEDIA_BASE_PATH}:/srv
+      - filebrowser_config:/config
+      - filebrowser_database:/database
+    networks:
+      - sync_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.filebrowser.rule=Host(`files.${PRIMARY_DOMAIN}`) || Host(`files.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.filebrowser.tls=true"
+      - "traefik.http.routers.filebrowser.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.filebrowser.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # KOPIA - Modern Backup Solution
+  # =============================================================================
+  kopia:
+    image: kopia/kopia:latest
+    container_name: kopia
+    restart: unless-stopped
+    environment:
+      - KOPIA_PASSWORD=${USER_PASSWORD}
+      - USER=kopia
+    volumes:
+      - kopia_config:/app/config
+      - kopia_cache:/app/cache
+      - kopia_logs:/app/logs
+      - ${MEDIA_BASE_PATH}:/data:ro
+      - ${BACKUP_LOCAL_PATH}:/repository
+    networks:
+      - sync_network
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.kopia.rule=Host(`kopia.${PRIMARY_DOMAIN}`) || Host(`kopia.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.kopia.tls=true"
+      - "traefik.http.routers.kopia.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.kopia.loadbalancer.server.port=51515"
+    command: server start --insecure --address=0.0.0.0:51515 --server-username=${USERNAME} --server-password=${USER_PASSWORD}
+
+  # =============================================================================
+  # RCLONE - Cloud Storage Sync
+  # =============================================================================
+  rclone:
+    image: rclone/rclone:latest
+    container_name: rclone
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ}
+    volumes:
+      - rclone_config:/config/rclone
+      - ${MEDIA_BASE_PATH}:/data
+      - ${BACKUP_LOCAL_PATH}:/backups
+    networks:
+      - sync_network
+    command: rcd --rc-web-gui --rc-addr=0.0.0.0:5572 --rc-user=${USERNAME} --rc-pass=${USER_PASSWORD}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.rclone.rule=Host(`rclone.${PRIMARY_DOMAIN}`) || Host(`rclone.${SECONDARY_DOMAIN}`)"
+      - "traefik.http.routers.rclone.tls=true"
+      - "traefik.http.routers.rclone.tls.certresolver=${CERT_RESOLVER}"
+      - "traefik.http.services.rclone.loadbalancer.server.port=5572"
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  sync_network:
+    driver: bridge
+    internal: false
+  proxy_network:
+    external: true
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  # Syncthing
+  syncthing_config:
+  
+  # Resilio Sync
+  resilio_config:
+  
+  # Seafile
+  seafile_data:
+  seafile_db_data:
+  
+  # OwnCloud
+  owncloud_data:
+  owncloud_db_data:
+  
+  # FileBrowser
+  filebrowser_config:
+  filebrowser_database:
+  
+  # Kopia
+  kopia_config:
+  kopia_cache:
+  kopia_logs:
+  
+  # Rclone
+  rclone_config:
+

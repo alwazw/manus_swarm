@@ -1,5 +1,4 @@
 # networking.yml
-version: '3.8'
 
 services:
   librespeed:

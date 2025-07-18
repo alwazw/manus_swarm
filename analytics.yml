@@ -1,6 +1,5 @@
 
 # analytics.yml
-version: '3.8'
 
 services:
   grafana:
