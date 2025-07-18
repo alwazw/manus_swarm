@@ -1,0 +1,24 @@
+# media.yml
+version: '3.8'
+
+services:
+  plex:
+    <<: *default-app-config # Extend common settings
+    container_name: plex
+    image: lscr.io/linuxserver/plex:latest
+    ports:
+      - "${PLEX_PORT}:32400"
+    environment:
+      VERSION: docker
+    volumes:
+      - plex_config:/config # Changed to named volume
+      # These remain bind mounts for your existing media library, which is outside Docker's managed volumes
+      - ${MEDIA_PATH}/tvseries:/tv:rslave # rslave for FUSE mounts
+      - ${MEDIA_PATH}/movies:/movies:rslave # rslave for FUSE mounts
+    networks:
+      - media_network
+
+networks:
+  media_network:
+    external: true
+
