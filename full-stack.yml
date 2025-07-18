@@ -1,0 +1,546 @@
+# =============================================================================
+# COMPREHENSIVE SELF-HOSTED INFRASTRUCTURE STACK
+# =============================================================================
+# Complete cloud replacement with enterprise-grade security and monitoring
+# Includes: Authentication, Media, Monitoring, Logging, Security, Networking
+# 
+# DEPLOYMENT: docker compose -f full-stack.yml up -d
+# =============================================================================
+
+# Common configuration anchor
+x-common-config: &common-config
+  restart: unless-stopped
+  networks:
+    - infrastructure
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# Environment variables anchor
+x-env-config: &env-config
+  PUID: ${PUID:-1000}
+  PGID: ${PGID:-1000}
+  TZ: ${TZ:-UTC}
+
+services:
+  # =============================================================================
+  # REVERSE PROXY & SSL TERMINATION
+  # =============================================================================
+  traefik:
+    <<: *common-config
+    image: traefik:v3.0
+    container_name: traefik
+    command:
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --log.level=INFO
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik:/etc/traefik:ro
+      - traefik-letsencrypt:/letsencrypt
+    environment:
+      <<: *env-config
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+      - "traefik.http.services.traefik.loadbalancer.server.port=8080"
+
+  # =============================================================================
+  # AUTHENTICATION & SSO
+  # =============================================================================
+  authentik-redis:
+    <<: *common-config
+    image: redis:alpine
+    container_name: authentik-redis
+    command: --save 60 1 --loglevel warning
+    volumes:
+      - authentik-redis:/data
+
+  authentik-postgresql:
+    <<: *common-config
+    image: postgres:15-alpine
+    container_name: authentik-postgresql
+    environment:
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRES_PASSWORD}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRES_USER:-authentik}
+      POSTGRES_DB: ${AUTHENTIK_POSTGRES_DB:-authentik}
+    volumes:
+      - authentik-postgresql:/var/lib/postgresql/data
+
+  authentik-server:
+    <<: *common-config
+    image: ghcr.io/goauthentik/server:2024.2.2
+    container_name: authentik-server
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRES_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRES_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRES_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_AVATARS: "none"
+    volumes:
+      - authentik-media:/media
+      - authentik-custom-templates:/templates
+    depends_on:
+      - authentik-postgresql
+      - authentik-redis
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.authentik.rule=Host(`${DOMAIN}`) && PathPrefix(`/outpost.goauthentik.io/`, `/if/`, `/media/`, `/static/`, `/api/`, `/js/`, `/css/`, `/application/`, `/user/`, `/flows/`, `/admin/`)"
+      - "traefik.http.routers.authentik.entrypoints=websecure"
+      - "traefik.http.routers.authentik.tls.certresolver=letsencrypt"
+      - "traefik.http.services.authentik.loadbalancer.server.port=9000"
+      - "traefik.http.routers.authentik-login.rule=Host(`${DOMAIN}`) && Path(`/login`)"
+      - "traefik.http.routers.authentik-login.entrypoints=websecure"
+      - "traefik.http.routers.authentik-login.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.authentik-login.middlewares=authentik-login-redirect"
+      - "traefik.http.middlewares.authentik-login-redirect.redirectregex.regex=^https://${DOMAIN}/login$$"
+      - "traefik.http.middlewares.authentik-login-redirect.redirectregex.replacement=https://${DOMAIN}/if/flow/default-authentication-flow/"
+
+  authentik-worker:
+    <<: *common-config
+    image: ghcr.io/goauthentik/server:2024.2.2
+    container_name: authentik-worker
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRES_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRES_DB:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRES_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+    volumes:
+      - authentik-media:/media
+      - authentik-custom-templates:/templates
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - authentik-postgresql
+      - authentik-redis
+
+  # =============================================================================
+  # APPLICATION DASHBOARD
+  # =============================================================================
+  heimdall:
+    <<: *common-config
+    image: lscr.io/linuxserver/heimdall:latest
+    container_name: heimdall
+    environment:
+      <<: *env-config
+    volumes:
+      - heimdall-config:/config
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.heimdall.rule=Host(`apps.${DOMAIN}`)"
+      - "traefik.http.routers.heimdall.entrypoints=websecure"
+      - "traefik.http.routers.heimdall.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.heimdall.middlewares=authentik-forward-auth"
+      - "traefik.http.services.heimdall.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # DATABASE SERVICES
+  # =============================================================================
+  postgres:
+    <<: *common-config
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-maindb}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    <<: *common-config
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # DATABASE MANAGEMENT
+  # =============================================================================
+  pgadmin:
+    <<: *common-config
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    depends_on:
+      - postgres
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pgadmin.rule=Host(`pgadmin.${DOMAIN}`)"
+      - "traefik.http.routers.pgadmin.entrypoints=websecure"
+      - "traefik.http.routers.pgadmin.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.pgadmin.middlewares=authentik-forward-auth"
+      - "traefik.http.services.pgadmin.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # MONITORING & METRICS
+  # =============================================================================
+  prometheus:
+    <<: *common-config
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./config/prometheus:/etc/prometheus
+      - prometheus-data:/prometheus
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.${DOMAIN}`)"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.routers.prometheus.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.prometheus.middlewares=authentik-forward-auth"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+
+  grafana:
+    <<: *common-config
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: "grafana-clock-panel,grafana-simple-json-datasource"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.grafana.middlewares=authentik-forward-auth"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  node-exporter:
+    <<: *common-config
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+
+  cadvisor:
+    <<: *common-config
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /cgroup:/cgroup:ro
+
+  # =============================================================================
+  # LOGGING STACK
+  # =============================================================================
+  loki:
+    <<: *common-config
+    image: grafana/loki:latest
+    container_name: loki
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki-data:/loki
+      - ./config/loki:/etc/loki
+
+  promtail:
+    <<: *common-config
+    image: grafana/promtail:latest
+    container_name: promtail
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./config/promtail:/etc/promtail
+    depends_on:
+      - loki
+
+  # =============================================================================
+  # MEDIA & FILE SERVICES
+  # =============================================================================
+  nextcloud:
+    <<: *common-config
+    image: nextcloud:latest
+    container_name: nextcloud
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${NEXTCLOUD_DB:-nextcloud}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:-admin}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      NEXTCLOUD_TRUSTED_DOMAINS: "nextcloud.${DOMAIN} nextcloud.${DOMAIN_ALT}"
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: "nextcloud.${DOMAIN}"
+    volumes:
+      - nextcloud-data:/var/www/html
+      - ${MEDIA_PATH}/documents:/var/www/html/data/admin/files/Documents
+      - ${MEDIA_PATH}/photos:/var/www/html/data/admin/files/Photos
+    depends_on:
+      - postgres
+      - redis
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nextcloud.rule=Host(`nextcloud.${DOMAIN}`)"
+      - "traefik.http.routers.nextcloud.entrypoints=websecure"
+      - "traefik.http.routers.nextcloud.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.nextcloud.middlewares=authentik-forward-auth"
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+
+  photoprism:
+    <<: *common-config
+    image: photoprism/photoprism:latest
+    container_name: photoprism
+    environment:
+      PHOTOPRISM_ADMIN_USER: ${PHOTOPRISM_ADMIN_USER:-admin}
+      PHOTOPRISM_ADMIN_PASSWORD: ${PHOTOPRISM_ADMIN_PASSWORD}
+      PHOTOPRISM_AUTH_MODE: "password"
+      PHOTOPRISM_SITE_URL: "https://photos.${DOMAIN}/"
+      PHOTOPRISM_DISABLE_TLS: "false"
+      PHOTOPRISM_DEFAULT_TLS: "true"
+      PHOTOPRISM_ORIGINALS_LIMIT: 5000
+      PHOTOPRISM_HTTP_COMPRESSION: "gzip"
+      PHOTOPRISM_LOG_LEVEL: "info"
+      PHOTOPRISM_READONLY: "false"
+      PHOTOPRISM_EXPERIMENTAL: "false"
+      PHOTOPRISM_DISABLE_CHOWN: "false"
+      PHOTOPRISM_DISABLE_WEBDAV: "false"
+      PHOTOPRISM_DISABLE_SETTINGS: "false"
+      PHOTOPRISM_DISABLE_TENSORFLOW: "false"
+      PHOTOPRISM_DISABLE_FACES: "false"
+      PHOTOPRISM_DISABLE_CLASSIFICATION: "false"
+      PHOTOPRISM_DISABLE_VECTORS: "false"
+      PHOTOPRISM_DISABLE_RAW: "false"
+      PHOTOPRISM_RAW_PRESETS: "false"
+      PHOTOPRISM_JPEG_QUALITY: 85
+      PHOTOPRISM_DETECT_NSFW: "false"
+      PHOTOPRISM_UPLOAD_NSFW: "true"
+      PHOTOPRISM_DATABASE_DRIVER: "postgres"
+      PHOTOPRISM_DATABASE_SERVER: "postgres:5432"
+      PHOTOPRISM_DATABASE_NAME: ${PHOTOPRISM_DB:-photoprism}
+      PHOTOPRISM_DATABASE_USER: ${POSTGRES_USER:-postgres}
+      PHOTOPRISM_DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      PHOTOPRISM_SITE_CAPTION: "AI-Powered Photos App"
+      PHOTOPRISM_SITE_DESCRIPTION: "Self-hosted photo management"
+      PHOTOPRISM_SITE_AUTHOR: "${USER_NAME}"
+    volumes:
+      - photoprism-data:/photoprism/storage
+      - ${MEDIA_PATH}/photos:/photoprism/originals
+      - ${MEDIA_PATH}/photos/import:/photoprism/import
+    depends_on:
+      - postgres
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.photoprism.rule=Host(`photos.${DOMAIN}`)"
+      - "traefik.http.routers.photoprism.entrypoints=websecure"
+      - "traefik.http.routers.photoprism.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.photoprism.middlewares=authentik-forward-auth"
+      - "traefik.http.services.photoprism.loadbalancer.server.port=2342"
+
+  plex:
+    <<: *common-config
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    environment:
+      <<: *env-config
+      VERSION: docker
+      PLEX_CLAIM: ${PLEX_CLAIM}
+    volumes:
+      - plex-config:/config
+      - ${MEDIA_PATH}/movies:/movies
+      - ${MEDIA_PATH}/tv_series:/tv
+      - ${MEDIA_PATH}/music:/music
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.plex.rule=Host(`plex.${DOMAIN}`)"
+      - "traefik.http.routers.plex.entrypoints=websecure"
+      - "traefik.http.routers.plex.tls.certresolver=letsencrypt"
+      - "traefik.http.services.plex.loadbalancer.server.port=32400"
+
+  # =============================================================================
+  # FILE SYNCHRONIZATION
+  # =============================================================================
+  syncthing:
+    <<: *common-config
+    image: lscr.io/linuxserver/syncthing:latest
+    container_name: syncthing
+    environment:
+      <<: *env-config
+    volumes:
+      - syncthing-config:/config
+      - ${MEDIA_PATH:-/mnt/media}:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.syncthing.rule=Host(`sync.${DOMAIN}`)"
+      - "traefik.http.routers.syncthing.entrypoints=websecure"
+      - "traefik.http.routers.syncthing.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.syncthing.middlewares=authentik-forward-auth"
+      - "traefik.http.services.syncthing.loadbalancer.server.port=8384"
+
+  # =============================================================================
+  # CONTAINER MANAGEMENT
+  # =============================================================================
+  portainer:
+    <<: *common-config
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    command: -H unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer-data:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.portainer.rule=Host(`portainer.${DOMAIN}`)"
+      - "traefik.http.routers.portainer.entrypoints=websecure"
+      - "traefik.http.routers.portainer.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.portainer.middlewares=authentik-forward-auth"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+  # =============================================================================
+  # NOTIFICATIONS
+  # =============================================================================
+  ntfy:
+    <<: *common-config
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    command:
+      - serve
+    environment:
+      NTFY_BASE_URL: "https://ntfy.${DOMAIN}"
+      NTFY_UPSTREAM_BASE_URL: "https://ntfy.sh"
+      NTFY_LISTEN_HTTP: ":80"
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_AUTH_DEFAULT_ACCESS: "read-write"
+      NTFY_ENABLE_SIGNUP: "false"
+      NTFY_ENABLE_LOGIN: "true"
+    volumes:
+      - ntfy-data:/var/lib/ntfy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ntfy.rule=Host(`ntfy.${DOMAIN}`)"
+      - "traefik.http.routers.ntfy.entrypoints=websecure"
+      - "traefik.http.routers.ntfy.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.ntfy.middlewares=authentik-forward-auth"
+      - "traefik.http.services.ntfy.loadbalancer.server.port=80"
+
+  # =============================================================================
+  # CLOUDFLARE TUNNEL
+  # =============================================================================
+  cloudflared:
+    <<: *common-config
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - traefik
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  infrastructure:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  # Authentication
+  authentik-redis:
+  authentik-postgresql:
+  authentik-media:
+  authentik-custom-templates:
+  
+  # Databases
+  postgres-data:
+  redis-data:
+  pgadmin-data:
+  
+  # Monitoring
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  
+  # Media & Files
+  nextcloud-data:
+  photoprism-data:
+  plex-config:
+  syncthing-config:
+  
+  # Management
+  portainer-data:
+  heimdall-config:
+  
+  # Notifications
+  ntfy-data:
+  
+  # SSL Certificates
+  traefik-letsencrypt:
+
