@@ -1,0 +1,98 @@
+http:
+  routers:
+    # Root domain routing - Authentik login
+    authentik-login:
+      rule: "Host(`10.10.10.131`) && PathPrefix(`/login`)"
+      service: authentik-server
+      priority: 100
+      entryPoints:
+        - web
+        - websecure
+      tls:
+        certResolver: letsencrypt
+
+    # Root domain routing - Heimdall dashboard (default)
+    heimdall-root:
+      rule: "Host(`10.10.10.131`) && PathPrefix(`/`)"
+      service: heimdall
+      priority: 50
+      entryPoints:
+        - web
+        - websecure
+      middlewares:
+        - authentik-forward-auth
+      tls:
+        certResolver: letsencrypt
+
+    # Domain-based routing for visionvation.com
+    authentik-login-domain:
+      rule: "Host(`visionvation.com`) && PathPrefix(`/login`)"
+      service: authentik-server
+      priority: 100
+      entryPoints:
+        - web
+        - websecure
+      tls:
+        certResolver: letsencrypt
+
+    # Apps subdomain routing
+    heimdall-apps:
+      rule: "Host(`apps.visionvation.com`)"
+      service: heimdall
+      entryPoints:
+        - web
+        - websecure
+      middlewares:
+        - authentik-forward-auth
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    authentik-server:
+      loadBalancer:
+        servers:
+          - url: "http://authentik-server:9000"
+
+    heimdall:
+      loadBalancer:
+        servers:
+          - url: "http://heimdall:80"
+
+  middlewares:
+    authentik-forward-auth:
+      forwardAuth:
+        address: "http://authentik-server:9000/outpost.goauthentik.io/auth/traefik"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - X-authentik-username
+          - X-authentik-groups
+          - X-authentik-email
+          - X-authentik-name
+          - X-authentik-uid
+          - X-authentik-jwt
+          - X-authentik-meta-jwks
+          - X-authentik-meta-outpost
+          - X-authentik-meta-provider
+          - X-authentik-meta-app
+          - X-authentik-meta-version
+
+    secure-headers:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - OPTIONS
+          - PUT
+        accessControlAllowOriginList:
+          - "*"
+        accessControlMaxAge: 100
+        hostsProxyHeaders:
+          - "X-Forwarded-Host"
+        referrerPolicy: "same-origin"
+        sslRedirect: true
+        sslHost: "visionvation.com"
+        sslForceHost: true
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+

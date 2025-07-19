@@ -1,0 +1,202 @@
+# Port Conflict Fix - Services without port conflicts
+# This configuration ensures only Traefik uses port 80/443 externally
+
+services:
+  # =============================================================================
+  # REVERSE PROXY & SSL
+  # =============================================================================
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--log.level=INFO"
+    ports:
+      - "80:80"     # Only Traefik uses port 80
+      - "443:443"   # Only Traefik uses port 443  
+      - "8080:8080" # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik:/etc/traefik:ro
+      - traefik-acme:/acme.json
+    networks:
+      - proxy_network
+    restart: unless-stopped
+
+  # =============================================================================
+  # AUTHENTICATION & SSO
+  # =============================================================================
+  authentik-postgresql:
+    image: postgres:15-alpine
+    container_name: authentik-postgresql
+    environment:
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRESQL_PASSWORD}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRESQL_USER}
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL_DB}
+    volumes:
+      - authentik-postgresql-data:/var/lib/postgresql/data
+    networks:
+      - proxy_network
+    restart: unless-stopped
+
+  authentik-redis:
+    image: redis:alpine
+    container_name: authentik-redis
+    command: --save 60 1 --loglevel warning
+    volumes:
+      - authentik-redis-data:/data
+    networks:
+      - proxy_network
+    restart: unless-stopped
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2024.2.2
+    container_name: authentik-server
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL_USER}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL_DB}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+      - authentik-custom-templates:/templates
+    # NO external port - only accessible through Traefik
+    networks:
+      - proxy_network
+    depends_on:
+      - authentik-postgresql
+      - authentik-redis
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.authentik.rule=Host(`10.10.10.131`) && PathPrefix(`/login`)"
+      - "traefik.http.routers.authentik.entrypoints=web,websecure"
+      - "traefik.http.routers.authentik.tls.certresolver=letsencrypt"
+      - "traefik.http.services.authentik.loadbalancer.server.port=9000"
+    restart: unless-stopped
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2024.2.2
+    container_name: authentik-worker
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL_USER}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL_DB}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+      - authentik-custom-templates:/templates
+    networks:
+      - proxy_network
+    depends_on:
+      - authentik-postgresql
+      - authentik-redis
+    restart: unless-stopped
+
+  # =============================================================================
+  # DASHBOARD
+  # =============================================================================
+  heimdall:
+    image: lscr.io/linuxserver/heimdall:latest
+    container_name: heimdall
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: ${TIMEZONE}
+    volumes:
+      - heimdall-config:/config
+    # NO external port - only accessible through Traefik
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.heimdall.rule=Host(`10.10.10.131`) && PathPrefix(`/`)"
+      - "traefik.http.routers.heimdall.entrypoints=web,websecure"
+      - "traefik.http.routers.heimdall.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.heimdall.priority=50"
+      - "traefik.http.services.heimdall.loadbalancer.server.port=80"
+    restart: unless-stopped
+
+  # =============================================================================
+  # MONITORING
+  # =============================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: "grafana-clock-panel,grafana-simple-json-datasource"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+    # NO external port - only accessible through Traefik
+    networks:
+      - proxy_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.visionvation.com`) || Host(`10.10.10.131`) && PathPrefix(`/grafana`)"
+      - "traefik.http.routers.grafana.entrypoints=web,websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    restart: unless-stopped
+
+  # =============================================================================
+  # DATABASE
+  # =============================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - proxy_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    networks:
+      - proxy_network
+    restart: unless-stopped
+
+networks:
+  proxy_network:
+    external: false
+
+volumes:
+  traefik-acme:
+  authentik-postgresql-data:
+  authentik-redis-data:
+  authentik-media:
+  authentik-custom-templates:
+  heimdall-config:
+  grafana-data:
+  postgres-data:
+  redis-data:
+
