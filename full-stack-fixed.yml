@@ -300,10 +300,10 @@ services:
     <<: *common-config
     image: grafana/loki:latest
     container_name: loki
-    command: -config.file=/etc/loki/local-config.yaml
+    command: -config.file=/etc/loki/local-config-fixed.yaml
     volumes:
-      - loki-data:/loki
-      - ./config/loki:/etc/loki
+      - loki-data:/tmp/loki
+      - ./config/loki/local-config-fixed.yaml:/etc/loki/local-config-fixed.yaml
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.loki.rule=Host(`${LOKI_SUBDOMAIN}.${PRIMARY_DOMAIN}`)"
